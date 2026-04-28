@@ -55,32 +55,5 @@ def main():
     else:
         print("Uso padrão: \nPara processar PDFs: python main.py --ingest\nPara interagir: python main.py --chat")
 
-    # import os
-    # from dotenv import load_dotenv
-    # from mistralai.client import Mistral
-
-    # load_dotenv()
-    # client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
-
-    #     # Com dimensão reduzida e precisão int8 (mais econômico)
-    # response = client.embeddings.create(
-    #     model="codestral-embed-2505",
-    #     inputs=["SELECT * FROM users WHERE id = ?"],
-    #     output_dtype="int8",       # float | int8 | uint8 | binary | ubinary
-    #     output_dimension=512,      # padrão: 1536, máximo: 3072
-    # )
-
-    # print(f"Dimensão: {len(response.data[0].embedding)}")
-    # print(response.data[0].embedding)
-
-    from langchain_mistralai import MistralAIEmbeddings
-
-    embeddings = MistralAIEmbeddings(
-        model="codestral-embed-2505",
-    )
-    text = "Text qualquer"
-    single_vector = embeddings.embed_query(text)
-    print(single_vector)
-
 if __name__ == '__main__':
     main()
