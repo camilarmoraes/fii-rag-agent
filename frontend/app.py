@@ -10,11 +10,23 @@ from qdrant_client.models import Distance, VectorParams
 
 from server.src.fii_rag.config import AppConfig
 from server.src.fii_rag.db import QdrantStoreProvider
-from server.src.fii_rag.chunking import LangChainParser, LangChainSemanticExtractor
-from server.src.fii_rag.ingestion import PDFIngestionManager
+from server.src.fii_rag.chunking import (
+    ALL_STRATEGIES,
+    LangChainParser,
+    LangChainSemanticExtractor,
+)
+from server.src.fii_rag.ingestion import (
+    IngestionPipeline,
+    PDFIngestionManager,
+    build_ingestion_pipeline,
+)
 from server.src.fii_rag.retriever import HybridQueryEngineBuilder
 from server.src.fii_rag.agent import RAGAgent
-from server.src.fii_rag.store import QdrantRepository
+from server.src.fii_rag.store import (
+    CollectionNaming,
+    LogicalCollectionProvisioner,
+    QdrantRepository,
+)
 
 # ──────────────────────────────────────────────
 # Configuração da Página
@@ -228,6 +240,59 @@ def get_raw_client():
     return QdrantClient(url=config.qdrant_url)
 
 
+def get_provisioner(client: QdrantClient) -> LogicalCollectionProvisioner:
+    return LogicalCollectionProvisioner(QdrantRepository(client))
+
+
+@st.cache_resource(show_spinner="⚙️ Inicializando pipeline de ingestão...")
+def get_ingestion_pipeline() -> IngestionPipeline:
+    return build_ingestion_pipeline(AppConfig())
+
+
+def classify_collections(client: QdrantClient):
+    """Separa colls em 2 grupos: lógicas (com info de strategies) e legadas.
+
+    Retorna `(logical_dicts, legacy_names)` onde cada `logical_dict` tem
+    `logical`, `strategies`, `config` (lido de `_LOGICAL_CONFIG_` quando
+    disponível).
+    """
+    prov = get_provisioner(client)
+    logicals = prov.list_logical()
+    legacy = prov.list_legacy()
+    logical_dicts = []
+    for li in logicals:
+        cfg = prov.read_logical_config(li.logical) or {}
+        logical_dicts.append(
+            {
+                "logical": li.logical,
+                "strategies": li.strategies,
+                "has_summary": li.has_summary,
+                "config": cfg,
+            }
+        )
+    return logical_dicts, legacy
+
+
+# Identificadores no selectbox: prefixo "[L]" para lógicas, "[Legacy]" para soltas
+LOGICAL_PREFIX = "[L] "
+LEGACY_PREFIX = "[Legacy] "
+
+
+def build_selector_options(logicals, legacies) -> list[str]:
+    return [LOGICAL_PREFIX + l["logical"] for l in logicals] + [
+        LEGACY_PREFIX + name for name in legacies
+    ]
+
+
+def parse_selector(label: str) -> tuple[str, str]:
+    """Devolve `(kind, name)` onde `kind` ∈ {"logical", "legacy"}."""
+    if label.startswith(LOGICAL_PREFIX):
+        return "logical", label[len(LOGICAL_PREFIX) :]
+    if label.startswith(LEGACY_PREFIX):
+        return "legacy", label[len(LEGACY_PREFIX) :]
+    return "legacy", label  # fallback
+
+
 # ══════════════════════════════════════════════
 # PÁGINA: CHAT
 # ══════════════════════════════════════════════
@@ -238,17 +303,23 @@ if page == "💬 Chat":
     # Seletor de collection para o chat
     try:
         client = get_raw_client()
-        collections = [c.name for c in client.get_collections().collections]
+        logicals, legacies = classify_collections(client)
     except Exception:
-        collections = ["fii_reports"]
+        logicals, legacies = [], ["fii_reports"]
 
-    if not collections:
+    options = build_selector_options(logicals, legacies)
+    if not options:
         st.warning("⚠️ Nenhuma collection encontrada. Crie uma na aba **Collections** e insira documentos.")
         st.stop()
 
     col_chat, col_cfg = st.columns([3, 1])
     with col_cfg:
-        selected_collection = st.selectbox("Collection", collections, key="chat_collection")
+        selected_label = st.selectbox("Collection", options, key="chat_collection")
+        kind, selected_name = parse_selector(selected_label)
+        if kind == "logical":
+            st.caption("🔗 Coleção lógica · usando `__recursive` (PR 5 trará two-stage)")
+        else:
+            st.caption("🗄️ Coleção legacy")
 
     # Histórico de mensagens
     if "messages" not in st.session_state:
@@ -271,7 +342,13 @@ if page == "💬 Chat":
         with st.spinner("⏳ Buscando + Reranking + Mistral AI..."):
             try:
                 _, _, _, agent, _ = get_components()
-                agent.collection_name = selected_collection
+                # Lógica → aponta pra `__recursive` (placeholder até PR 5)
+                target = (
+                    CollectionNaming.to_physical(selected_name, "recursive")
+                    if kind == "logical"
+                    else selected_name
+                )
+                agent.collection_name = target
                 agent.chain = None  # força rebuild na collection certa
                 agent._setup_engine()
                 response = agent.chain.invoke({"input": user_input})
@@ -297,148 +374,280 @@ elif page == "📚 Collections":
 
     try:
         client = get_raw_client()
-        collections = client.get_collections().collections
+        logicals, legacies = classify_collections(client)
     except Exception as e:
         st.error(f"Não foi possível conectar ao Qdrant: {e}")
         st.stop()
 
-    # ── Criar nova collection ──────────────────
-    with st.expander("➕ Criar nova collection", expanded=False):
+    # ── Criar nova collection lógica ───────────
+    non_summary_strategies = [s for s in ALL_STRATEGIES if s != "summary"]
+
+    with st.expander("➕ Criar nova coleção lógica (multi-strategy)", expanded=False):
         st.caption(
-            "💡 Escolha a dimensão que corresponde ao seu modelo de embeddings. "
-            "Hybrid search adiciona um vetor esparso BM25 (FastEmbed) ao lado do "
-            "dense — recomendado para relatórios com tickers, CNPJs e termos raros."
+            "💡 Uma coleção lógica provisiona internamente N sub-coleções "
+            "(`<nome>__summary`, `<nome>__recursive`, etc.) — cada uma indexa "
+            "o documento com uma estratégia de chunking distinta. Você só vê o "
+            "nome lógico aqui."
         )
-        with st.form("create_collection_form"):
-            new_name = st.text_input("Nome da collection", placeholder="ex: fii_reports_2024")
-            col_a, col_b, col_c = st.columns(3)
+        with st.form("create_logical_form"):
+            new_name = st.text_input(
+                "Nome da coleção", placeholder="ex: fii_2026 (apenas letras/dígitos/_)"
+            )
+            col_a, col_b = st.columns(2)
             with col_a:
                 vector_size = st.selectbox(
                     "Dimensão do vetor denso",
                     options=[768, 1024, 1536, 3072],
                     index=3,
-                    help="Deve corresponder à dimensão de saída do seu modelo de embeddings.",
+                )
+                hybrid = st.toggle(
+                    "Busca híbrida (BM25 + dense)",
+                    value=True,
+                    help="Cria também o vetor sparse para fusão RRF nativa.",
                 )
             with col_b:
                 distance = st.selectbox("Métrica de distância", ["Cosine", "Dot", "Euclid"])
-            with col_c:
-                hybrid = st.toggle(
-                    "Busca híbrida (BM25)",
-                    value=True,
-                    help=(
-                        "Cria a coleção com vetor named `dense` + sparse `sparse`. "
-                        "A query usa prefetch dense+sparse e funde com RRF nativo "
-                        "do Qdrant."
-                    ),
+                selected_extras = st.multiselect(
+                    "Estratégias de chunking",
+                    options=non_summary_strategies,
+                    default=non_summary_strategies,
+                    help="`summary` é sempre incluída automaticamente.",
                 )
-            submit_create = st.form_submit_button("Criar", use_container_width=True)
+            submit_create = st.form_submit_button("Criar coleção lógica", use_container_width=True)
 
         if submit_create:
             if not new_name.strip():
-                st.error("Informe um nome para a collection.")
+                st.error("Informe um nome para a coleção.")
+            elif not CollectionNaming.is_valid_logical(new_name.strip()):
+                st.error("Nome inválido. Use apenas letras, dígitos e `_`, máx 40 chars.")
+            else:
+                dist_map = {"Cosine": Distance.COSINE, "Dot": Distance.DOT, "Euclid": Distance.EUCLID}
+                strategies = ["summary"] + list(selected_extras)
+                try:
+                    prov = get_provisioner(client)
+                    result = prov.provision(
+                        logical=new_name.strip(),
+                        strategies=strategies,
+                        hybrid=hybrid,
+                        dense_dim=vector_size,
+                        distance=dist_map[distance],
+                    )
+                    st.success(
+                        f"✅ Coleção lógica **{new_name}** criada com "
+                        f"{len(result['physical_names'])} físicas: "
+                        f"{', '.join(result['physical_names'])}"
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Erro ao provisionar: {e}")
+
+    # ── Criar coll legada (single-coll) ────────
+    with st.expander("➕ Criar coleção avulsa (legacy single-coll)", expanded=False):
+        st.caption(
+            "Modo simples: 1 vetor por coleção, sem multi-strategy. "
+            "Mantido para compatibilidade — recomendamos coleções lógicas para projetos novos."
+        )
+        with st.form("create_legacy_form"):
+            legacy_name = st.text_input("Nome", placeholder="ex: fii_legacy")
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                legacy_size = st.selectbox(
+                    "Dimensão", options=[768, 1024, 1536, 3072], index=3, key="legacy_size"
+                )
+            with col_b:
+                legacy_distance = st.selectbox(
+                    "Métrica", ["Cosine", "Dot", "Euclid"], key="legacy_distance"
+                )
+            with col_c:
+                legacy_hybrid = st.toggle(
+                    "Hybrid (BM25)", value=True, key="legacy_hybrid"
+                )
+            submit_legacy = st.form_submit_button("Criar (legacy)", use_container_width=True)
+
+        if submit_legacy:
+            if not legacy_name.strip():
+                st.error("Informe um nome.")
             else:
                 dist_map = {"Cosine": Distance.COSINE, "Dot": Distance.DOT, "Euclid": Distance.EUCLID}
                 try:
                     repo = QdrantRepository(client)
                     repo.ensure_collection(
-                        name=new_name.strip(),
-                        dim=vector_size,
-                        distance=dist_map[distance],
-                        hybrid=hybrid,
+                        name=legacy_name.strip(),
+                        dim=legacy_size,
+                        distance=dist_map[legacy_distance],
+                        hybrid=legacy_hybrid,
                     )
-                    hybrid_label = "hybrid" if hybrid else "dense-only"
-                    st.success(
-                        f"✅ Collection **{new_name}** criada! "
-                        f"({vector_size}d · {distance} · {hybrid_label})"
-                    )
+                    st.success(f"✅ Coleção legacy **{legacy_name}** criada.")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Erro ao criar collection: {e}")
+                    st.error(f"Erro ao criar legacy: {e}")
 
     st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
 
     # ── Listagem das collections ───────────────
-    if not collections:
-        st.info("Nenhuma collection encontrada. Crie uma acima.")
+    total_count = len(logicals) + len(legacies)
+    if total_count == 0:
+        st.info("Nenhuma coleção encontrada. Crie uma acima.")
     else:
-        # Métricas globais
-        m1, m2 = st.columns(2)
+        m1, m2, m3 = st.columns(3)
         with m1:
-            st.markdown(f'<div class="metric-box"><div class="metric-value">{len(collections)}</div><div class="metric-label">Collections</div></div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="metric-box"><div class="metric-value">{len(logicals)}</div><div class="metric-label">Lógicas</div></div>',
+                unsafe_allow_html=True,
+            )
         with m2:
-            total_docs = 0
-            for c in collections:
+            st.markdown(
+                f'<div class="metric-box"><div class="metric-value">{len(legacies)}</div><div class="metric-label">Legadas</div></div>',
+                unsafe_allow_html=True,
+            )
+        with m3:
+            total_pts = 0
+            for li in logicals:
+                for s in li["strategies"]:
+                    try:
+                        total_pts += client.get_collection(
+                            CollectionNaming.to_physical(li["logical"], s)
+                        ).points_count or 0
+                    except Exception:
+                        pass
+            for n in legacies:
                 try:
-                    info = client.get_collection(c.name)
-                    total_docs += info.points_count or 0
+                    total_pts += client.get_collection(n).points_count or 0
                 except Exception:
                     pass
-            st.markdown(f'<div class="metric-box"><div class="metric-value">{total_docs}</div><div class="metric-label">Documentos totais</div></div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="metric-box"><div class="metric-value">{total_pts}</div><div class="metric-label">Pontos totais</div></div>',
+                unsafe_allow_html=True,
+            )
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        for col in collections:
-            with st.expander(f"📂 {col.name}", expanded=False):
-                try:
-                    info = client.get_collection(col.name)
-                    pts = info.points_count or 0
-                    vec_size = None
-                    dist_name = "—"
-                    cfg = info.config.params.vectors
-                    if isinstance(cfg, dict):
-                        first = next(iter(cfg.values()), None)
-                        if first:
-                            vec_size = first.size
-                            dist_name = str(first.distance).replace("Distance.", "")
-                    else:
-                        vec_size = getattr(cfg, "size", None)
-                        dist_name = str(getattr(cfg, "distance", "—")).replace("Distance.", "")
+        # Lógicas
+        if logicals:
+            st.markdown("### 🧩 Coleções lógicas")
+            for li in logicals:
+                logical = li["logical"]
+                cfg = li["config"]
+                hybrid_logical = cfg.get("hybrid", "—")
+                dense_dim = cfg.get("dense_dim", "—")
+                distance_label = str(cfg.get("distance", "—")).replace("Distance.", "")
+                strategies_chips = " · ".join(li["strategies"])
 
-                    sparse_cfg = getattr(info.config.params, "sparse_vectors", None)
-                    is_hybrid = bool(sparse_cfg)
+                with st.expander(f"🧩 **{logical}** · {strategies_chips}", expanded=False):
                     c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Documentos", pts)
-                    c2.metric("Dimensão", vec_size or "—")
-                    c3.metric("Distância", dist_name)
-                    c4.metric("Hybrid", "Sim" if is_hybrid else "Não")
+                    c1.metric("Estratégias", len(li["strategies"]))
+                    c2.metric("Dimensão", dense_dim)
+                    c3.metric("Distância", distance_label)
+                    c4.metric("Hybrid", "Sim" if hybrid_logical else "Não")
 
-                    # Pré-visualização dos documentos
-                    if pts > 0:
-                        st.markdown("**Amostra de documentos:**")
-                        points = client.scroll(
-                            collection_name=col.name,
-                            limit=5,
-                            with_payload=True,
-                            with_vectors=False,
-                        )[0]
-                        for p in points:
-                            meta = p.payload or {}
-                            content = meta.get("page_content", meta.get("text", "—"))
-                            title = meta.get("metadata", {}).get("title", meta.get("title", "Sem título"))
-                            keywords = meta.get("metadata", {}).get("keywords", meta.get("keywords", []))
-                            with st.container():
+                    # Conta docs (pontos não-config) em __summary
+                    summary_coll = CollectionNaming.to_physical(logical, "summary")
+                    try:
+                        from server.src.fii_rag.store import exclude_config_filter
+
+                        n_docs = client.count(
+                            collection_name=summary_coll,
+                            count_filter=exclude_config_filter(),
+                            exact=True,
+                        ).count
+                    except Exception:
+                        n_docs = "—"
+
+                    # Total de chunks somados em todas as strategies não-summary
+                    n_chunks = 0
+                    for s in li["strategies"]:
+                        if s == "summary":
+                            continue
+                        try:
+                            n_chunks += client.get_collection(
+                                CollectionNaming.to_physical(logical, s)
+                            ).points_count or 0
+                        except Exception:
+                            pass
+
+                    st.markdown(
+                        f"📄 Documentos: **{n_docs}** · ✂️ Chunks (somados): **{n_chunks}**"
+                    )
+
+                    with st.form(f"delete_logical_{logical}"):
+                        confirm = st.checkbox(
+                            f"Confirmo que quero deletar a lógica **{logical}** "
+                            f"(apaga {len(li['strategies'])} físicas em cascata)"
+                        )
+                        if st.form_submit_button("🗑️ Deletar lógica", type="secondary"):
+                            if confirm:
+                                try:
+                                    deleted = get_provisioner(client).delete_logical(logical)
+                                    st.success(f"Lógica **{logical}** deletada ({deleted} físicas apagadas).")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Erro ao deletar: {e}")
+                            else:
+                                st.warning("Marque a confirmação para deletar.")
+
+        # Legadas
+        if legacies:
+            st.markdown("### 🗄️ Coleções legadas")
+            for name in legacies:
+                with st.expander(f"🗄️ **{name}** `[Legacy]`", expanded=False):
+                    try:
+                        info = client.get_collection(name)
+                        pts = info.points_count or 0
+                        vec_size = None
+                        dist_name = "—"
+                        cfg = info.config.params.vectors
+                        if isinstance(cfg, dict):
+                            first = next(iter(cfg.values()), None)
+                            if first:
+                                vec_size = first.size
+                                dist_name = str(first.distance).replace("Distance.", "")
+                        else:
+                            vec_size = getattr(cfg, "size", None)
+                            dist_name = str(getattr(cfg, "distance", "—")).replace("Distance.", "")
+
+                        sparse_cfg = getattr(info.config.params, "sparse_vectors", None)
+                        is_hybrid = bool(sparse_cfg)
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Documentos", pts)
+                        c2.metric("Dimensão", vec_size or "—")
+                        c3.metric("Distância", dist_name)
+                        c4.metric("Hybrid", "Sim" if is_hybrid else "Não")
+
+                        if pts > 0:
+                            st.markdown("**Amostra:**")
+                            points = client.scroll(
+                                collection_name=name, limit=5, with_payload=True, with_vectors=False
+                            )[0]
+                            for p in points:
+                                meta = p.payload or {}
+                                content = meta.get("page_content", meta.get("text", "—"))
+                                title = meta.get("metadata", {}).get("title", meta.get("title", "Sem título"))
+                                keywords = meta.get("metadata", {}).get("keywords", meta.get("keywords", []))
                                 st.markdown(f"**{title}**")
                                 if keywords:
-                                    st.caption(f"🏷️ {' · '.join(keywords[:5]) if isinstance(keywords, list) else keywords}")
-                                st.markdown(f'<div class="info-card" style="font-size:0.85rem;color:#94a3b8;">{content[:400]}{"..." if len(content) > 400 else ""}</div>', unsafe_allow_html=True)
+                                    st.caption(
+                                        f"🏷️ {' · '.join(keywords[:5]) if isinstance(keywords, list) else keywords}"
+                                    )
+                                st.markdown(
+                                    f'<div class="info-card" style="font-size:0.85rem;color:#94a3b8;">{content[:400]}{"..." if len(content) > 400 else ""}</div>',
+                                    unsafe_allow_html=True,
+                                )
                                 st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+                    except Exception as e:
+                        st.error(f"Erro ao obter detalhes: {e}")
 
-                except Exception as e:
-                    st.error(f"Erro ao obter detalhes: {e}")
-
-                # Botão de deletar (perigoso — confirmação via checkbox)
-                with st.form(f"delete_form_{col.name}"):
-                    confirm = st.checkbox(f"Confirmo que quero deletar **{col.name}**")
-                    if st.form_submit_button("🗑️ Deletar collection", type="secondary"):
-                        if confirm:
-                            try:
-                                client.delete_collection(col.name)
-                                st.success(f"Collection {col.name} deletada.")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Erro ao deletar: {e}")
-                        else:
-                            st.warning("Marque a confirmação para deletar.")
+                    with st.form(f"delete_legacy_{name}"):
+                        confirm = st.checkbox(f"Confirmo deletar legacy **{name}**")
+                        if st.form_submit_button("🗑️ Deletar legacy", type="secondary"):
+                            if confirm:
+                                try:
+                                    client.delete_collection(name)
+                                    st.success(f"Legacy {name} deletada.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Erro ao deletar: {e}")
+                            else:
+                                st.warning("Marque a confirmação para deletar.")
 
 
 # ══════════════════════════════════════════════
@@ -451,14 +660,24 @@ elif page == "📄 Inserir Documento":
     # Seletor de collection destino
     try:
         client = get_raw_client()
-        collections = [c.name for c in client.get_collections().collections]
+        logicals, legacies = classify_collections(client)
     except Exception:
-        collections = []
+        logicals, legacies = [], []
 
+    options = build_selector_options(logicals, legacies)
     col_a, col_b = st.columns([2, 1])
     with col_a:
-        if collections:
-            target_collection = st.selectbox("Collection destino", collections, key="ingest_collection")
+        if options:
+            selected_label = st.selectbox(
+                "Coleção destino", options, key="ingest_collection"
+            )
+            target_kind, target_name = parse_selector(selected_label)
+            if target_kind == "logical":
+                st.caption(
+                    "🔗 Coleção lógica · usa `IngestionPipeline` (multi-strategy + hybrid)"
+                )
+            else:
+                st.caption("🗄️ Coleção legacy · usa pipeline antigo (single-coll)")
         else:
             st.warning("⚠️ Nenhuma collection encontrada. Crie uma primeiro na aba **📚 Collections**.")
             st.stop()
@@ -473,14 +692,22 @@ elif page == "📄 Inserir Documento":
     if uploaded_file is not None:
         st.markdown(f'<div class="info-card">📄 <b>{uploaded_file.name}</b> · {uploaded_file.size / 1024:.1f} KB</div>', unsafe_allow_html=True)
 
-        # Opções avançadas
-        with st.expander("⚙️ Opções avançadas de chunking"):
-            chunk_size = st.slider("Tamanho do chunk (tokens)", 200, 2000, 1000, 100)
-            chunk_overlap = st.slider("Overlap do chunk (tokens)", 0, 500, 200, 50)
-            extract_metadata = st.toggle("Extrair metadados semânticos via Mistral AI", value=True)
+        # Opções avançadas (aplicáveis ao pipeline LEGACY)
+        if target_kind == "legacy":
+            with st.expander("⚙️ Opções avançadas (legacy)"):
+                chunk_size = st.slider("Tamanho do chunk (tokens)", 200, 2000, 1000, 100)
+                chunk_overlap = st.slider("Overlap do chunk (tokens)", 0, 500, 200, 50)
+                extract_metadata = st.toggle("Extrair metadados via Mistral AI", value=True)
+        else:
+            st.info(
+                "ℹ️ Pipeline lógico usa todas as estratégias da coleção e os "
+                "parâmetros de chunking do `.env`. Os metadados-doc + sumário "
+                "são extraídos automaticamente via DOC_SUMMARY_LLM."
+            )
+            chunk_size = chunk_overlap = None
+            extract_metadata = True
 
         if st.button("🚀 Iniciar Ingestão", type="primary", use_container_width=True):
-            # Salva PDF temporariamente
             import tempfile
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -491,39 +718,59 @@ elif page == "📄 Inserir Documento":
             status = st.empty()
 
             try:
-                config = AppConfig()
-                llm, embed_model = config.get_llm_and_embeddings()
-
-                progress.progress(10, text="Conectando ao Qdrant...")
-                qdrant_provider = QdrantStoreProvider(url=config.qdrant_url, embed_model=embed_model)
-                vector_store = qdrant_provider.get_store(target_collection)
-
-                progress.progress(25, text="Carregando PDF...")
-                from langchain_community.document_loaders import PyMuPDFLoader
-                loader = PyMuPDFLoader(tmp_path)
-                documents = loader.load()
-                status.info(f"📄 {len(documents)} página(s) carregada(s).")
-
-                progress.progress(40, text="Fragmentando em chunks...")
-                parser = LangChainParser(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-                splitter = parser.get_parser()
-                splits = splitter.split_documents(documents)
-                status.info(f"✂️ {len(splits)} chunks gerados.")
-
-                if extract_metadata:
-                    progress.progress(55, text=f"Extraindo metadados via Mistral ({len(splits)} chunks)...")
-                    extractor = LangChainSemanticExtractor(llm=llm)
-                    extractor_fn = extractor.get_extractors()
-                    enriched_splits = extractor_fn(splits)
+                if target_kind == "logical":
+                    progress.progress(10, text="Inicializando pipeline...")
+                    pipeline = get_ingestion_pipeline()
+                    progress.progress(30, text=f"Ingerindo em {target_name} (multi-strategy)...")
+                    result = pipeline.run(tmp_path, target_name)
+                    progress.progress(100, text="Concluído!")
+                    per_strategy = result["per_strategy"]
+                    summary_lines = "\n".join(
+                        f"• `{name}`: {n} pontos" + (" ⚠️" if n < 0 else "")
+                        for name, n in per_strategy.items()
+                    )
+                    st.success(
+                        f"✅ **{uploaded_file.name}** ingerido em **{target_name}**!\n\n"
+                        f"doc_id: `{result['doc_id']}`\n\n{summary_lines}"
+                    )
                 else:
-                    enriched_splits = splits
+                    config = AppConfig()
+                    llm, embed_model = config.get_llm_and_embeddings()
 
-                progress.progress(80, text="Inserindo no Qdrant...")
-                vector_store.add_documents(documents=enriched_splits)
+                    progress.progress(10, text="Conectando ao Qdrant...")
+                    qdrant_provider = QdrantStoreProvider(url=config.qdrant_url, embed_model=embed_model)
+                    vector_store = qdrant_provider.get_store(target_name)
 
-                progress.progress(100, text="Concluído!")
-                st.success(f"✅ **{uploaded_file.name}** ingerido com sucesso! {len(enriched_splits)} chunks inseridos na collection **{target_collection}**.")
+                    progress.progress(25, text="Carregando PDF...")
+                    from langchain_community.document_loaders import PyMuPDFLoader
 
+                    loader = PyMuPDFLoader(tmp_path)
+                    documents = loader.load()
+                    status.info(f"📄 {len(documents)} página(s) carregada(s).")
+
+                    progress.progress(40, text="Fragmentando em chunks...")
+                    parser = LangChainParser(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+                    splitter = parser.get_parser()
+                    splits = splitter.split_documents(documents)
+                    status.info(f"✂️ {len(splits)} chunks gerados.")
+
+                    if extract_metadata:
+                        progress.progress(
+                            55, text=f"Extraindo metadados via Mistral ({len(splits)} chunks)..."
+                        )
+                        extractor = LangChainSemanticExtractor(llm=llm)
+                        extractor_fn = extractor.get_extractors()
+                        enriched_splits = extractor_fn(splits)
+                    else:
+                        enriched_splits = splits
+
+                    progress.progress(80, text="Inserindo no Qdrant...")
+                    vector_store.add_documents(documents=enriched_splits)
+                    progress.progress(100, text="Concluído!")
+                    st.success(
+                        f"✅ **{uploaded_file.name}** ingerido (legacy)! "
+                        f"{len(enriched_splits)} chunks na coll **{target_name}**."
+                    )
             except Exception as e:
                 st.error(f"❌ Erro durante a ingestão: {e}")
             finally:

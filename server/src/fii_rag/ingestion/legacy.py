@@ -1,32 +1,38 @@
+"""`PDFIngestionManager` legado — preservado para colls antigas (com badge "Legacy" no frontend).
+
+Nova arquitetura usa `IngestionPipeline` em `pipeline.py`. Este shim será
+removido no PR 6 quando todas as colls legadas estiverem migradas.
+"""
+
 import os
+
 from langchain_community.document_loaders import PyMuPDFLoader
 
-from server.src.fii_rag.interfaces import IVectorStoreProvider, IDocumentParser, IMetadataExtractor
+from server.src.fii_rag.interfaces import (
+    IDocumentParser,
+    IMetadataExtractor,
+    IVectorStoreProvider,
+)
+
 
 class PDFIngestionManager:
-    """
-    Orquestra a ingestão de PDFs na base Qdrant através do LangChain.
-    """
-    
     def __init__(
-        self, 
+        self,
         vector_store_provider: IVectorStoreProvider,
         document_parser: IDocumentParser,
         metadata_extractor: IMetadataExtractor,
         data_dir: str = "data",
-        collection_name: str = "fii_reports"
+        collection_name: str = "fii_reports",
     ):
         self.vector_store_provider = vector_store_provider
-        # LangChain text splitter
         self.document_parser = document_parser
-        # Extrator de Metadados Semânticos
         self.metadata_extractor = metadata_extractor
         self.data_dir = data_dir
         self.collection_name = collection_name
 
     def run(self):
         print(f"Lendo documentos PDF do diretório: {self.data_dir}...")
-        
+
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir)
             print(f"Diretório {self.data_dir} criado. Adicione seus PDFs antes de rodar.")
@@ -45,20 +51,19 @@ class PDFIngestionManager:
             return
 
         vector_store = self.vector_store_provider.get_store(self.collection_name)
-        
         parser = self.document_parser.get_parser()
         extractor_fn = self.metadata_extractor.get_extractors()
 
         print("Processando chunks (Recursive Character Split)...")
-        # Transforma OS Documentos em Chunks (LangChain envia classes Document)
         splits = parser.split_documents(documents)
-        
-        # O extractor_fn é uma função que nós dovolvemos no chunking.py
-        print(f"Iniciando API Mistral para extração semântica em {len(splits)} chunks... Isso pode levar um tempo.")
+
+        print(
+            f"Iniciando API Mistral para extração semântica em {len(splits)} chunks... "
+            "Isso pode levar um tempo."
+        )
         enriched_splits = extractor_fn(splits)
-        
+
         print(f"Inserindo {len(enriched_splits)} chunks gerados no Qdrant...")
-        # Usa embeddings fornecidas no provider pelo LangChain nativamente
         vector_store.add_documents(documents=enriched_splits)
-        
+
         print("Ingestão concluída com sucesso! (LangChain Ready)")

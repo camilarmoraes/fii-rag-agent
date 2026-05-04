@@ -4,6 +4,11 @@ from server.src.fii_rag.store.naming import (
     PHYSICAL_SUFFIX_SEPARATOR,
     CollectionNaming,
 )
+from server.src.fii_rag.store.provisioner import (
+    LogicalCollectionInfo,
+    LogicalCollectionProvisioner,
+    exclude_config_filter,
+)
 from server.src.fii_rag.store.repository import QdrantRepository
 from server.src.fii_rag.store.schema import (
     DENSE_VECTOR_NAME,
@@ -16,8 +21,11 @@ __all__ = [
     "CollectionSchemaBuilder",
     "DENSE_VECTOR_NAME",
     "LOGICAL_NAME_RE",
+    "LogicalCollectionInfo",
+    "LogicalCollectionProvisioner",
     "PHYSICAL_SUFFIX_SEPARATOR",
     "QdrantClientFactory",
     "QdrantRepository",
     "SPARSE_VECTOR_NAME",
+    "exclude_config_filter",
 ]
