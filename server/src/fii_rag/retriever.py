@@ -50,10 +50,26 @@ class _NativeQdrantRetriever(BaseRetriever):
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun
     ) -> List[Document]:
         embed_model = self.provider.embed_model
-        query_vec = embed_model.embed_query(query)
-        scored = self.provider.repository.query_dense(
-            self.collection_name, vector=query_vec, limit=self.top_k
-        )
+        repo = self.provider.repository
+        query_dense = embed_model.embed_query(query)
+
+        if repo.has_sparse_vectors(self.collection_name):
+            query_sparse = self.provider.get_sparse_embedder().embed_query_to_qdrant(query)
+            scored = repo.query_hybrid(
+                self.collection_name,
+                dense_vector=query_dense,
+                sparse_vector=query_sparse,
+                limit=self.top_k,
+            )
+        else:
+            using = "dense" if repo.is_named_vectors(self.collection_name) else None
+            scored = repo.query_dense(
+                self.collection_name,
+                vector=query_dense,
+                using=using,
+                limit=self.top_k,
+            )
+
         docs = [_payload_to_document(p.payload or {}) for p in scored]
 
         if self.reranker is not None and len(docs) > self.rerank_top_k:
