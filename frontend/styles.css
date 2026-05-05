@@ -1,0 +1,121 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif;
+}
+
+/* Fundo escuro premium */
+.stApp {
+    background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 50%, #16213e 100%);
+    color: #e2e8f0;
+}
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0d0d1a 0%, #1a1a2e 100%);
+    border-right: 1px solid rgba(99, 102, 241, 0.2);
+}
+
+/* Cards / containers */
+.info-card {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(99,102,241,0.25);
+    border-radius: 12px;
+    padding: 1.2rem 1.5rem;
+    margin-bottom: 1rem;
+}
+
+/* Título principal */
+.hero-title {
+    font-size: 2.4rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, #818cf8, #c084fc, #38bdf8);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    line-height: 1.2;
+    margin-bottom: 0.3rem;
+}
+
+.hero-sub {
+    color: #94a3b8;
+    font-size: 1rem;
+    margin-bottom: 2rem;
+}
+
+/* Badge de status */
+.badge-ok {
+    display: inline-block;
+    background: rgba(34,197,94,0.15);
+    color: #4ade80;
+    border: 1px solid rgba(34,197,94,0.3);
+    border-radius: 999px;
+    padding: 0.2rem 0.8rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+}
+.badge-err {
+    display: inline-block;
+    background: rgba(239,68,68,0.15);
+    color: #f87171;
+    border: 1px solid rgba(239,68,68,0.3);
+    border-radius: 999px;
+    padding: 0.2rem 0.8rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+}
+
+/* Chat bubbles */
+.chat-user {
+    background: linear-gradient(135deg, #4f46e5, #7c3aed);
+    color: white;
+    border-radius: 18px 18px 4px 18px;
+    padding: 0.8rem 1.2rem;
+    margin: 0.5rem 0 0.5rem 3rem;
+    font-size: 0.95rem;
+    box-shadow: 0 4px 15px rgba(79,70,229,0.3);
+}
+.chat-bot {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(99,102,241,0.2);
+    color: #e2e8f0;
+    border-radius: 18px 18px 18px 4px;
+    padding: 0.8rem 1.2rem;
+    margin: 0.5rem 3rem 0.5rem 0;
+    font-size: 0.95rem;
+}
+.chat-label {
+    font-size: 0.72rem;
+    color: #64748b;
+    margin-bottom: 0.2rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}
+
+/* Separador */
+.section-divider {
+    border: none;
+    border-top: 1px solid rgba(99,102,241,0.15);
+    margin: 1.5rem 0;
+}
+
+/* Métrica */
+.metric-box {
+    background: rgba(99,102,241,0.08);
+    border: 1px solid rgba(99,102,241,0.2);
+    border-radius: 10px;
+    padding: 1rem;
+    text-align: center;
+}
+.metric-value {
+    font-size: 2rem;
+    font-weight: 700;
+    color: #818cf8;
+}
+.metric-label {
+    font-size: 0.8rem;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
