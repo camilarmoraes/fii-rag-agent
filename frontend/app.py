@@ -21,6 +21,7 @@ from server.src.fii_rag.ingestion import (
     build_ingestion_pipeline,
 )
 from server.src.fii_rag.retriever import HybridQueryEngineBuilder
+from server.src.fii_rag.retrieval import RetrieverBuilder, build_retriever_builder
 from server.src.fii_rag.agent import RAGAgent
 from server.src.fii_rag.store import (
     CollectionNaming,
@@ -249,6 +250,11 @@ def get_ingestion_pipeline() -> IngestionPipeline:
     return build_ingestion_pipeline(AppConfig())
 
 
+@st.cache_resource(show_spinner="⚙️ Inicializando retriever builder...")
+def get_retriever_builder() -> RetrieverBuilder:
+    return build_retriever_builder(AppConfig())
+
+
 def classify_collections(client: QdrantClient):
     """Separa colls em 2 grupos: lógicas (com info de strategies) e legadas.
 
@@ -276,6 +282,54 @@ def classify_collections(client: QdrantClient):
 # Identificadores no selectbox: prefixo "[L]" para lógicas, "[Legacy]" para soltas
 LOGICAL_PREFIX = "[L] "
 LEGACY_PREFIX = "[Legacy] "
+
+
+def _serialize_docs(docs) -> list[dict]:
+    """Converte `Document`s do LangChain em dicts leves para session_state."""
+    out: list[dict] = []
+    for d in docs:
+        meta = getattr(d, "metadata", {}) or {}
+        out.append(
+            {
+                "text": getattr(d, "page_content", str(d)),
+                "strategy": meta.get("_strategy", "—"),
+                "score": float(meta.get("_score") or 0.0),
+                "ticker": meta.get("ticker") or "",
+                "year": meta.get("report_year"),
+                "quarter": meta.get("report_quarter"),
+                "page_number": meta.get("page_number"),
+                "section_heading": meta.get("section_heading"),
+            }
+        )
+    return out
+
+
+def _render_docs_panel(docs) -> None:
+    """Renderiza o painel 'Trechos usados' com badges. `docs` aceita Documents ou dicts."""
+    if not docs:
+        return
+    items = docs if isinstance(docs[0], dict) else _serialize_docs(docs)
+    n = len(items)
+    with st.expander(f"📚 Trechos usados ({n})", expanded=False):
+        for i, item in enumerate(items):
+            badges = [f"`#{i + 1}`", f"`{item['strategy']}`"]
+            if item.get("ticker"):
+                badges.append(f"**{item['ticker']}**")
+            year = item.get("year")
+            quarter = item.get("quarter")
+            if year and quarter:
+                badges.append(f"{year}T{quarter}")
+            elif year:
+                badges.append(str(year))
+            if item.get("page_number"):
+                badges.append(f"p.{item['page_number']}")
+            if item.get("section_heading"):
+                badges.append(f"§ {item['section_heading'][:40]}")
+            st.markdown(" · ".join(badges))
+            text = item.get("text", "")
+            preview = text[:350] + ("..." if len(text) > 350 else "")
+            st.caption(preview)
+            st.markdown("---")
 
 
 def build_selector_options(logicals, legacies) -> list[str]:
@@ -317,9 +371,9 @@ if page == "💬 Chat":
         selected_label = st.selectbox("Collection", options, key="chat_collection")
         kind, selected_name = parse_selector(selected_label)
         if kind == "logical":
-            st.caption("🔗 Coleção lógica · usando `__recursive` (PR 5 trará two-stage)")
+            st.caption("🔗 Lógica · two-stage (summary → chunks filtrados + RRF)")
         else:
-            st.caption("🗄️ Coleção legacy")
+            st.caption("🗄️ Legacy · busca direta na coll")
 
     # Histórico de mensagens
     if "messages" not in st.session_state:
@@ -331,6 +385,8 @@ if page == "💬 Chat":
             st.markdown(f'<div class="chat-label">Você</div><div class="chat-user">{msg["content"]}</div>', unsafe_allow_html=True)
         else:
             st.markdown(f'<div class="chat-label">🤖 Agente FII</div><div class="chat-bot">{msg["content"]}</div>', unsafe_allow_html=True)
+            if msg.get("docs"):
+                _render_docs_panel(msg["docs"])
 
     # Input
     user_input = st.chat_input("Pergunte sobre os relatórios de FIIs...")
@@ -340,24 +396,26 @@ if page == "💬 Chat":
         st.markdown(f'<div class="chat-label">Você</div><div class="chat-user">{user_input}</div>', unsafe_allow_html=True)
 
         with st.spinner("⏳ Buscando + Reranking + Mistral AI..."):
+            docs_used: list = []
             try:
                 _, _, _, agent, _ = get_components()
-                # Lógica → aponta pra `__recursive` (placeholder até PR 5)
-                target = (
-                    CollectionNaming.to_physical(selected_name, "recursive")
-                    if kind == "logical"
-                    else selected_name
-                )
-                agent.collection_name = target
-                agent.chain = None  # força rebuild na collection certa
-                agent._setup_engine()
+                builder = get_retriever_builder()
+                if kind == "logical":
+                    agent.set_logical_collection(selected_name, builder)
+                else:
+                    agent.set_legacy_collection(selected_name, builder)
                 response = agent.chain.invoke({"input": user_input})
                 answer = response.get("answer", "Não foi possível gerar resposta.")
+                docs_used = response.get("context", []) or []
             except Exception as e:
                 answer = f"❌ Erro ao processar: {e}"
 
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.session_state.messages.append(
+            {"role": "assistant", "content": answer, "docs": _serialize_docs(docs_used)}
+        )
         st.markdown(f'<div class="chat-label">🤖 Agente FII</div><div class="chat-bot">{answer}</div>', unsafe_allow_html=True)
+        if docs_used:
+            _render_docs_panel(docs_used)
 
     if st.session_state.messages:
         if st.button("🗑️ Limpar conversa", type="secondary"):
