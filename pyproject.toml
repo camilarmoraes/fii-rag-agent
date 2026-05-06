@@ -19,8 +19,11 @@ dependencies = [
     "torch>=2.11.0",
     "transformers>=4.48.0",
     "langchain-classic>=1.0.3",
+    "langchain-experimental>=0.3.4",
     "mistralai>=2.4.0",
     "streamlit>=1.56.0",
     "google-genai>=1.73.1",
     "torchvision>=0.26.0",
+    "pydantic-settings>=2.6.0",
+    "pymupdf4llm>=0.0.17",
 ]
