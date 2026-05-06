@@ -1,85 +1,103 @@
-from qdrant_client import QdrantClient
-from qdrant_client.models import VectorParams
-from langchain_qdrant import QdrantVectorStore
+"""Shim de compatibilidade — `QdrantStoreProvider` agora delega ao `QdrantRepository`.
 
+Mantém a superfície usada pelo `main.py` legado e pelo `frontend/app.py`
+(`url`, `embed_model`, `get_store(...)`). A diferença é que `get_store` não
+retorna mais um `QdrantVectorStore` (langchain-qdrant) — retorna o próprio
+`provider`, que expõe `add_documents` consumido pelo `PDFIngestionManager`
+reescrito.
+
+Será deletado no PR 6 junto com a interface `IVectorStoreProvider`.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+from uuid import uuid4
+
+from qdrant_client.models import Distance, PointStruct
+
+from server.src.fii_rag.embeddings import adapt_to_dimension
 from server.src.fii_rag.interfaces import IVectorStoreProvider
+from server.src.fii_rag.store import QdrantClientFactory, QdrantRepository
+
+DEFAULT_COLLECTION = "fii_reports"
+
 
 class QdrantStoreProvider(IVectorStoreProvider):
+    """Adapter que conecta o pipeline legado ao `QdrantRepository`.
+
+    Antes: encapsulava `langchain_qdrant.QdrantVectorStore`.
+    Agora: encapsula `QdrantRepository` + faz upsert de PointStruct nativo.
+
+    O método `get_store` retorna `self`; o caller usa `.add_documents(docs)`
+    diretamente. Em produção nova (PR 4+), os consumidores devem usar
+    `provider.repository` em vez do shim.
     """
-    # TODO: Refatorar para usar o strategy pattern?
-    Provedor do banco Qdrant pelo LangChain.
-    Centraliza a lógica de conexão e acesso ao vector store.
-    """
-    def __init__(self, url: str, embed_model):
+
+    def __init__(self, url: str, embed_model: Any):
         self.url = url
         self.embed_model = embed_model
-        # Qdrant Vector Store requer o embed_model para criar embeddings no background,
-        # bem como setup para Sparse Vectors se configurado nativamente.
-        self._client = QdrantClient(url=self.url)
+        self.client = QdrantClientFactory.get(url)
+        self.repository = QdrantRepository(self.client)
+        self._active_collection: Optional[str] = None
 
-    def _adapt_embed_model(self, dimension: int):
-        """
-        Retorna uma cópia do embed_model reconfigurada para a dimensão
-        da collection existente no Qdrant.
+    # ------------------------------------------------------------------
+    # IVectorStoreProvider — back-compat
+    # ------------------------------------------------------------------
 
-        Modelos suportados:  # TODO: adicionar método genérico para suportar outros modelos e provedores
-        - GoogleGenerativeAIEmbeddings → parâmetro: output_dimensionality
-        - MistralAIEmbeddings          → parâmetro: output_dimension (se disponível na versão instalada)
+    def get_store(self, collection_name: str = DEFAULT_COLLECTION) -> "QdrantStoreProvider":
+        """Garante que a coleção existe e adapta o embed_model à sua dimensão.
+
+        Retorna `self` para permitir o uso ergonômico:
+            store = provider.get_store("fii_reports")
+            store.add_documents(docs)
         """
-        try:
-            from langchain_google_genai import GoogleGenerativeAIEmbeddings
-            if isinstance(self.embed_model, GoogleGenerativeAIEmbeddings):
-                return self.embed_model.model_copy(
-                    update={"output_dimensionality": dimension}
+        self._active_collection = collection_name
+        if self.repository.collection_exists(collection_name):
+            existing_dim = self.repository.detect_dense_dim(collection_name)
+            if existing_dim:
+                self.embed_model = adapt_to_dimension(self.embed_model, existing_dim)
+                print(
+                    f"[QdrantStoreProvider] Dimensão detectada: {existing_dim}d "
+                    f"— embed_model reconfigurado."
                 )
-        except ImportError:
-            pass
+        else:
+            probe = self.embed_model.embed_query("dimension probe")
+            self.repository.ensure_collection(
+                name=collection_name,
+                dim=len(probe),
+                distance=Distance.COSINE,
+                hybrid=False,
+            )
+            print(
+                f"[QdrantStoreProvider] Coleção '{collection_name}' criada com "
+                f"dim={len(probe)}, distance=COSINE."
+            )
+        return self
 
-        try:
-            from langchain_mistralai import MistralAIEmbeddings
-            if isinstance(self.embed_model, MistralAIEmbeddings):
-                # Verifica se a versão instalada expõe o campo output_dimension
-                if "output_dimension" in MistralAIEmbeddings.model_fields:
-                    return self.embed_model.model_copy(
-                        update={"output_dimension": dimension}
-                    )
-                else:
-                    print(
-                        f"[QdrantStoreProvider] Aviso: MistralAIEmbeddings na versão instalada "
-                        f"não expõe 'output_dimension'. Certifique-se de criar a collection com "
-                        f"a dimensão nativa do modelo."
-                    )
-        except ImportError:
-            pass
+    # ------------------------------------------------------------------
+    # Superfície que o PDFIngestionManager legado consome.
+    # ------------------------------------------------------------------
 
-        # Fallback: retorna o modelo original sem alteração
-        return self.embed_model
+    def add_documents(self, documents: list[Any]) -> None:
+        """Embeda + upserta PointStructs nativos.
 
-
-    def get_store(self, collection_name: str = "fii_reports") -> QdrantVectorStore:
+        Aceita `langchain_core.documents.Document` (que é o que sai do
+        LangChainParser/LangChainSemanticExtractor) — usa `page_content` e
+        `metadata`. O payload Qdrant fica `{"text": page_content, **metadata}`.
         """
-        Retorna o QdrantVectorStore para a collection indicada.
-        Detecta automaticamente a dimensão vetorial configurada na collection
-        e reconfigura o embed_model para gerar vetores compatíveis.
-        """
-        embed_model = self.embed_model
-        try:
-            info = self._client.get_collection(collection_name)
-            cfg = info.config.params.vectors
-            # Suporta collections com vetor único e named vectors
-            if isinstance(cfg, dict):
-                vec_dim = next(iter(cfg.values())).size
-            else:
-                vec_dim = getattr(cfg, "size", None)
+        if not documents:
+            return
+        if self._active_collection is None:
+            self.get_store(DEFAULT_COLLECTION)
 
-            if vec_dim:
-                embed_model = self._adapt_embed_model(vec_dim)
-                print(f"[QdrantStoreProvider] Dimensão detectada: {vec_dim}d — embed_model reconfigurado.")
-        except Exception as e:
-            print(f"[QdrantStoreProvider] Aviso: não foi possível detectar dimensão da collection '{collection_name}': {e}")
+        texts = [getattr(d, "page_content", str(d)) for d in documents]
+        vectors = self.embed_model.embed_documents(texts)
 
-        return QdrantVectorStore(
-            client=self._client,
-            collection_name=collection_name,
-            embedding=embed_model,
-        )
+        points: list[PointStruct] = []
+        for doc, vec, text in zip(documents, vectors, texts):
+            metadata = dict(getattr(doc, "metadata", {}) or {})
+            payload = {"text": text, **metadata}
+            points.append(PointStruct(id=str(uuid4()), vector=vec, payload=payload))
+
+        self.repository.upsert_points(self._active_collection, points)
