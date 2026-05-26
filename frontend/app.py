@@ -14,6 +14,7 @@ from server.src.fii_rag.chunking import LangChainParser, LangChainSemanticExtrac
 from server.src.fii_rag.ingestion import PDFIngestionManager
 from server.src.fii_rag.retriever import HybridQueryEngineBuilder
 from server.src.fii_rag.agent import RAGAgent
+from server.src.fii_rag.store import QdrantRepository
 
 # ──────────────────────────────────────────────
 # Configuração da Página
@@ -305,15 +306,15 @@ elif page == "📚 Collections":
     with st.expander("➕ Criar nova collection", expanded=False):
         st.caption(
             "💡 Escolha a dimensão que corresponde ao seu modelo de embeddings. "
-            "gemini-embedding-2-preview suporta **768d · 1536d · 3072d**. "
-            "A dimensão correta será detectada automaticamente na ingestão."
+            "Hybrid search adiciona um vetor esparso BM25 (FastEmbed) ao lado do "
+            "dense — recomendado para relatórios com tickers, CNPJs e termos raros."
         )
         with st.form("create_collection_form"):
             new_name = st.text_input("Nome da collection", placeholder="ex: fii_reports_2024")
             col_a, col_b, col_c = st.columns(3)
             with col_a:
                 vector_size = st.selectbox(
-                    "Dimensão do vetor",
+                    "Dimensão do vetor denso",
                     options=[768, 1024, 1536, 3072],
                     index=3,
                     help="Deve corresponder à dimensão de saída do seu modelo de embeddings.",
@@ -321,8 +322,16 @@ elif page == "📚 Collections":
             with col_b:
                 distance = st.selectbox("Métrica de distância", ["Cosine", "Dot", "Euclid"])
             with col_c:
-                st.markdown("<br>", unsafe_allow_html=True)
-                submit_create = st.form_submit_button("Criar", use_container_width=True)
+                hybrid = st.toggle(
+                    "Busca híbrida (BM25)",
+                    value=True,
+                    help=(
+                        "Cria a coleção com vetor named `dense` + sparse `sparse`. "
+                        "A query usa prefetch dense+sparse e funde com RRF nativo "
+                        "do Qdrant."
+                    ),
+                )
+            submit_create = st.form_submit_button("Criar", use_container_width=True)
 
         if submit_create:
             if not new_name.strip():
@@ -330,11 +339,18 @@ elif page == "📚 Collections":
             else:
                 dist_map = {"Cosine": Distance.COSINE, "Dot": Distance.DOT, "Euclid": Distance.EUCLID}
                 try:
-                    client.create_collection(
-                        collection_name=new_name.strip(),
-                        vectors_config=VectorParams(size=vector_size, distance=dist_map[distance]),
+                    repo = QdrantRepository(client)
+                    repo.ensure_collection(
+                        name=new_name.strip(),
+                        dim=vector_size,
+                        distance=dist_map[distance],
+                        hybrid=hybrid,
                     )
-                    st.success(f"✅ Collection **{new_name}** criada com sucesso! ({vector_size}d · {distance})")
+                    hybrid_label = "hybrid" if hybrid else "dense-only"
+                    st.success(
+                        f"✅ Collection **{new_name}** criada! "
+                        f"({vector_size}d · {distance} · {hybrid_label})"
+                    )
                     st.rerun()
                 except Exception as e:
                     st.error(f"Erro ao criar collection: {e}")
@@ -378,10 +394,13 @@ elif page == "📚 Collections":
                         vec_size = getattr(cfg, "size", None)
                         dist_name = str(getattr(cfg, "distance", "—")).replace("Distance.", "")
 
-                    c1, c2, c3 = st.columns(3)
+                    sparse_cfg = getattr(info.config.params, "sparse_vectors", None)
+                    is_hybrid = bool(sparse_cfg)
+                    c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Documentos", pts)
                     c2.metric("Dimensão", vec_size or "—")
                     c3.metric("Distância", dist_name)
+                    c4.metric("Hybrid", "Sim" if is_hybrid else "Não")
 
                     # Pré-visualização dos documentos
                     if pts > 0:

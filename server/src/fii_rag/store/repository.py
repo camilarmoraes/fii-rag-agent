@@ -14,13 +14,18 @@ from qdrant_client.models import (
     CollectionInfo,
     Distance,
     Filter,
+    Fusion,
+    FusionQuery,
     PointStruct,
+    Prefetch,
     Record,
     ScoredPoint,
+    SparseVector,
 )
 
 from server.src.fii_rag.store.schema import (
     DENSE_VECTOR_NAME,
+    SPARSE_VECTOR_NAME,
     CollectionSchemaBuilder,
 )
 
@@ -87,6 +92,12 @@ class QdrantRepository:
         info = self.get_collection_info(name)
         return isinstance(info.config.params.vectors, dict)
 
+    def has_sparse_vectors(self, name: str) -> bool:
+        """True se a coleção foi criada com `sparse_vectors_config`."""
+        info = self.get_collection_info(name)
+        sparse_cfg = getattr(info.config.params, "sparse_vectors", None)
+        return bool(sparse_cfg)
+
     # ------------------------------------------------------------------
     # Point-level
     # ------------------------------------------------------------------
@@ -117,6 +128,41 @@ class QdrantRepository:
             collection_name=name,
             query=vector,
             using=using,
+            query_filter=query_filter,
+            limit=limit,
+            with_payload=with_payload,
+        )
+        return result.points
+
+    def query_hybrid(
+        self,
+        name: str,
+        dense_vector: list[float],
+        sparse_vector: SparseVector,
+        limit: int = 10,
+        prefetch_limit: int = 40,
+        dense_using: str = DENSE_VECTOR_NAME,
+        sparse_using: str = SPARSE_VECTOR_NAME,
+        query_filter: Optional[Filter] = None,
+        with_payload: bool = True,
+    ) -> list[ScoredPoint]:
+        """Hybrid search: prefetch dense + sparse, fundidos via RRF nativo do Qdrant.
+
+        O `query_filter` é aplicado tanto nos prefetches quanto na fusão final.
+        Use `dense_using="dense"`/`sparse_using="sparse"` (defaults) para colls
+        criadas pelo `CollectionSchemaBuilder` deste projeto.
+        """
+        result = self.client.query_points(
+            collection_name=name,
+            prefetch=[
+                Prefetch(
+                    query=dense_vector, using=dense_using, limit=prefetch_limit
+                ),
+                Prefetch(
+                    query=sparse_vector, using=sparse_using, limit=prefetch_limit
+                ),
+            ],
+            query=FusionQuery(fusion=Fusion.RRF),
             query_filter=query_filter,
             limit=limit,
             with_payload=with_payload,
